@@ -1,5 +1,40 @@
 #include "ftl.h"
 
+/* ----- HOT, COLD ----- */
+#define THRES UINT64_MAX
+/* --------------------- */
+
+/* ----- IOPS ----- */
+static unsigned int inputOp = 0;
+static unsigned int outputOp = 0;
+static FILE *IOPSData;
+/* ---------------- */
+
+/* ----- THROUGHPUT ----- */
+static unsigned int totalRead = 0;
+static unsigned int totalWrite = 0;
+static FILE *throughputData;
+/* ---------------------- */
+
+/* ----- GC ----- */
+static unsigned int reclaimedBlocks = 0;
+static FILE *GCData;
+/* -------------- */
+
+/* ----- WAF ----- */
+static unsigned int hostWrite = 0;
+static unsigned int GCWrite = 0;
+static double WAF = 0;
+static FILE *WAFData;
+/* --------------- */
+
+/* ----- ACCESS COUNT ----- */
+static uint64_t accessCount[1048576] = {0};
+static char temp[] = "accessCountData";
+static char name[64];
+static FILE *accessCountData;
+/* ------------------------ */
+
 //#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
@@ -114,9 +149,15 @@ static void ssd_init_lines(struct ssd *ssd)
     lm->full_line_cnt = 0;
 }
 
-static void ssd_init_write_pointer(struct ssd *ssd)
+/* ----- HOT, COLD ----- */
+static void ssd_init_write_pointer(struct ssd *ssd, char status)
 {
-    struct write_pointer *wpp = &ssd->wp;
+    /* ----- HOT, COLD ----- */
+    struct write_pointer *wpp;
+    if (status == 'h') { wpp = &ssd->hotWp; }
+    else { wpp = &ssd->coldWp; }
+    /* --------------------- */
+
     struct line_mgmt *lm = &ssd->lm;
     struct line *curline = NULL;
 
@@ -129,9 +170,14 @@ static void ssd_init_write_pointer(struct ssd *ssd)
     wpp->ch = 0;
     wpp->lun = 0;
     wpp->pg = 0;
-    wpp->blk = 0;
+
+    /* ----- HOT, COLD ----- */
+    wpp->blk = wpp->curline->id;
+    /* --------------------- */
+
     wpp->pl = 0;
 }
+/* --------------------- */
 
 static inline void check_addr(int a, int max)
 {
@@ -154,10 +200,17 @@ static struct line *get_next_free_line(struct ssd *ssd)
     return curline;
 }
 
-static void ssd_advance_write_pointer(struct ssd *ssd)
+/* ----- HOT, COLD ----- */
+static void ssd_advance_write_pointer(struct ssd *ssd, char status)
 {
     struct ssdparams *spp = &ssd->sp;
-    struct write_pointer *wpp = &ssd->wp;
+
+    /* ----- HOT, COLD ----- */
+    struct write_pointer *wpp;
+    if (status == 'h') { wpp = &ssd->hotWp; }
+    else { wpp = &ssd->coldWp; }
+    /* --------------------- */
+
     struct line_mgmt *lm = &ssd->lm;
 
     check_addr(wpp->ch, spp->nchs);
@@ -207,10 +260,17 @@ static void ssd_advance_write_pointer(struct ssd *ssd)
         }
     }
 }
+/* --------------------- */
 
-static struct ppa get_new_page(struct ssd *ssd)
+/* ----- HOT, COLD ----- */
+static struct ppa get_new_page(struct ssd *ssd, char status)
 {
-    struct write_pointer *wpp = &ssd->wp;
+    /* ----- HOT, COLD ----- */
+    struct write_pointer *wpp;
+    if (status == 'h') { wpp = &ssd->hotWp; }
+    else { wpp = &ssd->coldWp; }
+    /* --------------------- */
+
     struct ppa ppa;
     ppa.ppa = 0;
     ppa.g.ch = wpp->ch;
@@ -222,6 +282,7 @@ static struct ppa get_new_page(struct ssd *ssd)
 
     return ppa;
 }
+/* --------------------- */
 
 static void check_params(struct ssdparams *spp)
 {
@@ -384,8 +445,11 @@ void ssd_init(FemuCtrl *n)
     /* initialize all the lines */
     ssd_init_lines(ssd);
 
+    /* ----- HOT, COLD ----- */
     /* initialize write pointer, this is how we allocate new pages for writes */
-    ssd_init_write_pointer(ssd);
+    ssd_init_write_pointer(ssd, 'h');
+    ssd_init_write_pointer(ssd, 'c');
+    /* --------------------- */
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
@@ -524,7 +588,7 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
     return lat;
 }
 
-/* update SSD status about one page from PG_VALID -> PG_INVALID */
+/* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
 {
     struct line_mgmt *lm = &ssd->lm;
@@ -612,6 +676,11 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
     blk->ipc = 0;
     blk->vpc = 0;
     blk->erase_cnt++;
+
+    /* ----- GC ----- */
+    reclaimedBlocks++;
+    /* -------------- */
+    
 }
 
 static void gc_read_page(struct ssd *ssd, struct ppa *ppa)
@@ -634,7 +703,12 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     uint64_t lpn = get_rmap_ent(ssd, old_ppa);
 
     ftl_assert(valid_lpn(ssd, lpn));
-    new_ppa = get_new_page(ssd);
+
+    /* ----- HOT, COLD ----- */
+    if (accessCount[lpn] > THRES) { new_ppa = get_new_page(ssd, 'h'); }
+    else { new_ppa = get_new_page(ssd, 'c'); }
+    /* --------------------- */
+
     /* update maptbl */
     set_maptbl_ent(ssd, lpn, &new_ppa);
     /* update rmap */
@@ -642,8 +716,11 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
 
     mark_page_valid(ssd, &new_ppa);
 
+    /* ----- HOT, COLD ----- */
     /* need to advance the write pointer here */
-    ssd_advance_write_pointer(ssd);
+    if (accessCount[lpn] > THRES) { ssd_advance_write_pointer(ssd, 'h'); }
+    else { ssd_advance_write_pointer(ssd, 'c'); }
+    /* --------------------- */
 
     if (ssd->sp.enable_gc_delay) {
         struct nand_cmd gcw;
@@ -704,6 +781,11 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
             /* delay the maptbl update until "write" happens */
             gc_write_page(ssd, ppa);
             cnt++;
+
+            /* ----- WAF ----- */
+            GCWrite += 1;
+            /* --------------- */
+            
         }
     }
 
@@ -798,6 +880,11 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         srd.stime = req->stime;
         sublat = ssd_advance_status(ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
+
+        /* ----- THROUGHPUT ----- */
+        totalRead += spp->secs_per_pg * 512;
+        /* ---------------------- */
+
     }
 
     return maxlat;
@@ -834,8 +921,12 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
             set_rmap_ent(ssd, INVALID_LPN, &ppa);
         }
 
+        /* ----- HOT, COLD ----- */
         /* new write */
-        ppa = get_new_page(ssd);
+        if (accessCount[lpn] > THRES) { ppa = get_new_page(ssd, 'h'); }
+        else { ppa = get_new_page(ssd, 'c'); }
+        /* --------------------- */
+
         /* update maptbl */
         set_maptbl_ent(ssd, lpn, &ppa);
         /* update rmap */
@@ -843,8 +934,11 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
         mark_page_valid(ssd, &ppa);
 
+        /* ----- HOT, COLD ----- */
         /* need to advance the write pointer here */
-        ssd_advance_write_pointer(ssd);
+        if (accessCount[lpn] > THRES) { ssd_advance_write_pointer(ssd, 'h'); }
+        else { ssd_advance_write_pointer(ssd, 'c'); }
+        /* --------------------- */
 
         struct nand_cmd swr;
         swr.type = USER_IO;
@@ -853,6 +947,19 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         /* get latency statistics */
         curlat = ssd_advance_status(ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
+
+        /* ----- THROUGHPUT ----- */
+        totalWrite += spp->secs_per_pg * 512;
+        /* ---------------------- */
+
+        /* ----- WAF ----- */
+        hostWrite += 1;
+        /* --------------- */
+
+        /* ----- ACCESS COUNT ----- */
+        accessCount[lpn] += 1;
+        /* ------------------------ */
+
     }
 
     return maxlat;
@@ -860,6 +967,37 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 
 static void *ftl_thread(void *arg)
 {
+
+    /* ----- IOPS, THROUGHPUT ----- */
+    struct timespec startTime;
+    clock_gettime(CLOCK_MONOTONIC, &startTime);
+    /* ---------------------------- */
+
+    /* ----- IOPS ----- */
+    IOPSData = fopen("IOPSData.csv", "w");
+    fprintf(IOPSData, "time,read,write,iops\n");
+    /* ---------------- */
+
+    /* ----- THROUGHPUT ----- */
+    throughputData = fopen("throughputData.csv", "w");
+    fprintf(throughputData, "time,readThroughput,writeThroughput,throughput\n");
+    /* ---------------------- */
+
+    /* ----- GC, WAF ----- */
+    struct timespec startTimeGCWAF;
+    clock_gettime(CLOCK_MONOTONIC, &startTimeGCWAF);
+    /* ------------------- */
+
+    /* ----- GC ----- */
+    GCData = fopen("GCData.csv", "w");
+    fprintf(GCData, "time,reclaimedBlocks\n");
+    /* -------------- */
+
+    /* ----- WAF ----- */
+    WAFData = fopen("WAFData.csv", "w");
+    fprintf(WAFData, "time,WAF\n");
+    /* --------------- */
+    
     FemuCtrl *n = (FemuCtrl *)arg;
     struct ssd *ssd = n->ssd;
     NvmeRequest *req = NULL;
@@ -889,9 +1027,19 @@ static void *ftl_thread(void *arg)
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
                 lat = ssd_write(ssd, req);
+
+                /* ----- IOPS ----- */
+                outputOp++;
+                /* ---------------- */
+
                 break;
             case NVME_CMD_READ:
                 lat = ssd_read(ssd, req);
+
+                /* ----- IOPS ----- */
+                inputOp++;
+                /* ---------------- */
+                
                 break;
             case NVME_CMD_DSM:
                 lat = 0;
@@ -909,12 +1057,89 @@ static void *ftl_thread(void *arg)
                 ftl_err("FTL to_poller enqueue failed\n");
             }
 
+            /* ----- THROUGHPUT ----- */
+            struct timespec currentTime;
+            clock_gettime(CLOCK_MONOTONIC, &currentTime);
+            char *timeStamp = ctime(&(time_t){time(NULL)});
+            /* ---------------------------- */
+
+            /* ----- IOPS, GC, WAF ----- */
+            struct timespec currentTimeGCWAF;
+            clock_gettime(CLOCK_MONOTONIC, &currentTimeGCWAF);
+            char *timeStampGCWAF = ctime(&(time_t){time(NULL)});
+            /* ------------------- */
+
+            if (currentTime.tv_sec - startTime.tv_sec >= 1) {
+
+                /* ----- THROUGHPUT ----- */
+                double readThroughput = totalRead / (1024.0 * 1024.0);
+                double writeThroughput = totalWrite / (1024.0 * 1024.0);
+                fprintf(
+                    throughputData, "%.15s,%.5f,%.5f,%.5f\n", timeStamp + 4, 
+                    readThroughput, writeThroughput, readThroughput + writeThroughput
+                );
+                fflush(throughputData);
+                totalRead = 0;
+                totalWrite = 0;
+                /* ---------------------- */
+
+                startTime = currentTime;
+            }
+
+            if (currentTimeGCWAF.tv_sec - startTimeGCWAF.tv_sec >= 10) {
+
+                /* ----- IOPS ----- */
+                fprintf(
+                    IOPSData, "%.15s,%u,%u,%u\n", timeStampGCWAF + 4, 
+                    inputOp, outputOp, inputOp + outputOp
+                );
+                fflush(IOPSData);
+                inputOp = 0;
+                outputOp = 0;
+                /* ---------------- */
+
+                /* ----- GC ----- */
+                fprintf(GCData, "%.15s,%u\n", timeStampGCWAF + 4, reclaimedBlocks);
+                fflush(GCData);
+                reclaimedBlocks = 0;
+                /* -------------- */
+
+                /* ----- WAF ----- */
+                WAF = (hostWrite > 0) ? (double)(hostWrite + GCWrite) / hostWrite : 0;
+                fprintf(WAFData, "%.15s,%.5f\n", timeStampGCWAF + 4, WAF);
+                fflush(WAFData);
+                hostWrite = 0;
+                GCWrite = 0;
+                /* --------------- */
+
+                /* ----- ACCESS COUNT ----- */
+                snprintf(name, sizeof(name), "%s_%.8s.csv", temp, timeStampGCWAF + 11);
+                accessCountData = fopen(name, "w");
+                fprintf(accessCountData, "lpn,accessCount\n");
+                for (unsigned int init = 0; init < 1048576; init++) {
+                    fprintf(accessCountData, "%u" ",%" PRIi64 "\n",init,accessCount[init]);
+                }
+                fflush(accessCountData);
+                fclose(accessCountData);
+                /* ------------------------ */
+
+                startTimeGCWAF = currentTimeGCWAF;
+            }
+
+
             /* clean one line if needed (in the background) */
             if (should_gc(ssd)) {
                 do_gc(ssd, false);
             }
         }
     }
+
+    /* ----- IOPS, THROUGHPUT, GC, WAF ----- */
+    fclose(IOPSData);
+    fclose(throughputData);
+    fclose(GCData);
+    fclose(WAFData);
+    /* ------------------------------------- */
 
     return NULL;
 }
